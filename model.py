@@ -13,6 +13,8 @@ import math
 from typing import Dict, List, Tuple, Set, Optional
 from functools import partial
 
+import numpy as np
+
 
 class CertaintyClassifier(BertPreTrainedModel):
     
@@ -895,6 +897,177 @@ class JointNerModReExtractorDistill(nn.Module):
             pred_outputs += (rel_ix_triplets,)
 
         return loss_outputs + pred_outputs, logits
+
+    @staticmethod
+    def description(epoch, epoch_num, output):
+        return f"L: {output['loss'].item():.6f}, L_ner: {output['crf_loss'].item():.6f}, " \
+               f"L_mod: {output['mod_loss'].item():.6f}, L_rel: {output['selection_loss'].item():.6f}, " \
+               f"epoch: {epoch}/{epoch_num}:"
+
+    @staticmethod
+    def masked_BCEloss(selection_logits, selection_gold, mask, reduction):
+        _, _, rel_size, _ = selection_logits.shape
+        # batch x seq x rel x seq
+        selection_mask = (mask.unsqueeze(2) * mask.unsqueeze(1)).unsqueeze(2).expand(-1, -1, rel_size, -1)
+        selection_loss = F.binary_cross_entropy_with_logits(selection_logits, selection_gold, reduction='none')
+        selection_loss = selection_loss.masked_select(selection_mask).sum()
+        if reduction in ['token_mean']:
+            selection_loss /= mask.sum()
+        return selection_loss
+
+    @staticmethod
+    def selection_decode(ner_tags, selection_tags, id2rel):
+
+        def find_entity(pos, s_ner_tags):
+            entity = []
+
+            if s_ner_tags[pos][0] in ['B', 'O']:
+                entity.append(pos)
+            else:
+                temp_entity = []
+                while s_ner_tags[pos][0] == 'I':
+                    temp_entity.append(pos)
+                    pos -= 1
+                    if pos < 0:
+                        break
+                    if s_ner_tags[pos][0] == 'B':
+                        temp_entity.append(pos)
+                        break
+                entity = list(reversed(temp_entity))
+            return entity
+
+        batch_num = len(ner_tags)
+        rel_ix_result = [[] for _ in range(batch_num)]
+        idx = torch.nonzero(selection_tags.cpu())
+
+        for i in range(idx.size(0)):
+            b, s, p, o = idx[i].tolist()
+
+            predicate = id2rel[p]
+            if predicate == 'N':
+                continue
+            tags = ner_tags[b]
+            object_ix = find_entity(o, tags)
+            subject_ix = find_entity(s, tags)
+            assert object_ix != [] and subject_ix != []
+
+            rel_ix_triplet = {
+                'subject': subject_ix,
+                'predicate': predicate,
+                'object': object_ix
+            }
+            rel_ix_result[b].append(rel_ix_triplet)
+        return rel_ix_result
+
+    @staticmethod
+    def inference(mask, decoded_tag, selection_logits, id2rel):
+        # mask: B x L x R x L
+        _, _, rel_size, _ = selection_logits.shape
+
+        selection_mask = (mask.unsqueeze(2) * mask.unsqueeze(1)).unsqueeze(2).expand(-1, -1, rel_size, -1)
+        selection_tags = (torch.sigmoid(selection_logits) * selection_mask.float()) > 0.5
+        selection_triplets = JointNerModReExtractor.selection_decode(decoded_tag, selection_tags, id2rel)
+        return selection_triplets
+
+class RelExtracter(nn.Module):
+    def __init__(self, bert_url,
+                 ner_emb_size, ner_vocab,
+                 mod_emb_size, mod_vocab,
+                 rel_emb_size, rel_vocab,
+                 hidden_size=768, device=None):
+        super(RelExtracter, self).__init__()
+
+        self.ner_vocab = ner_vocab
+        self.mod_vocab = mod_vocab
+        self.rel_vocab = rel_vocab
+
+        self.device = device
+
+        self.ner_emb = nn.Embedding(num_embeddings=len(ner_vocab), embedding_dim=ner_emb_size)
+        self.mod_emb = nn.Embedding(num_embeddings=len(mod_vocab), embedding_dim=mod_emb_size)
+        self.rel_emb = nn.Embedding(num_embeddings=len(rel_vocab), embedding_dim=rel_emb_size)
+
+        self.encoder = BertModel.from_pretrained(bert_url, output_hidden_states=True)
+
+        self.activation = nn.Tanh()
+
+        self.crf_tagger = CRF(len(ner_vocab), batch_first=True)
+
+        self.crf_emission = nn.Linear(hidden_size, len(ner_vocab))
+
+        self.mod_h2o = nn.Linear(hidden_size + ner_emb_size, len(mod_vocab))
+        self.mod_loss_func = nn.CrossEntropyLoss(reduction='none')
+
+        self.sel_u_mat = nn.Parameter(torch.Tensor(rel_emb_size, hidden_size + ner_emb_size + mod_emb_size))
+        nn.init.kaiming_uniform_(self.sel_u_mat, a=math.sqrt(5))
+
+        self.sel_v_mat = nn.Parameter(torch.Tensor(rel_emb_size, hidden_size + ner_emb_size + mod_emb_size))
+        nn.init.kaiming_uniform_(self.sel_v_mat, a=math.sqrt(5))
+
+        self.drop_uv = nn.Dropout(p=0.1)
+        # self.uv_rel = nn.Linear(hidden_size + ner_emb_size + mod_emb_size, rel_emb_size)
+        self.rel_h2o = nn.Linear(rel_emb_size, len(rel_vocab), bias=False)
+
+        self.id2ner = {v: k for k, v in self.ner_vocab.items()}
+        self.id2mod = {v: k for k, v in self.mod_vocab.items()}
+        self.id2rel = {v: k for k, v in self.rel_vocab.items()}
+
+    def forward(self, tokens, mask, sent_mask, ner_gold=None, mod_gold=None, rel_gold=None, reduction='token_mean'):
+
+        # output tuple
+        pred_outputs = ()
+        logits = ()
+
+        batch_size, seq_len = tokens.shape
+        _, _, all_hiddens = self.encoder(tokens, attention_mask=mask, token_type_ids=sent_mask)  # last hidden of BERT
+        low_o = all_hiddens[6]
+        high_o = all_hiddens[12]
+
+        # ner section
+        if all(gold is not None for gold in [ner_gold, mod_gold, rel_gold]):
+            pass
+        else:
+            decoded_ner = utils.decode_tensor_prediction(ner_gold, mask)
+            decoded_ner_tags = [list(map(lambda x: self.id2ner[x], tags)) for tags in decoded_ner]
+            pred_outputs += (decoded_ner_tags,)
+
+        ner_out = self.ner_emb(ner_gold)
+        o = torch.cat((low_o, ner_out), dim=2)
+
+        # mod section
+        if all(gold is not None for gold in [ner_gold, mod_gold, rel_gold]):
+            pass
+        else:
+            decoded_mod = utils.decode_tensor_prediction(mod_gold, mask)
+            pred_outputs += ([list(map(lambda x: self.id2mod[x], mod)) for mod in decoded_mod],)
+
+        mod_out = self.mod_emb(mod_gold)
+        o = torch.cat((high_o, ner_out, mod_out), dim=-1)
+
+        '''Multi-head Selection'''
+        # word representations: [b, l, r_s]
+        # broadcast sum: [b, l, 1, h] + [b, 1, l, h] = [b, l, l, h]
+        u = o.matmul(self.sel_u_mat.t())  # [b, l, h_s] -> [b, l, r_s]
+        v = o.matmul(self.sel_v_mat.t())  # [b, l, h_s] -> [b, l, r_s]
+        uv = u.unsqueeze(2) + v.unsqueeze(1)
+        # rel_logits = torch.einsum('bijh,rh->birj', [uv, self.relation_emb.weight])
+        uv_logits = self.drop_uv(self.activation(uv))
+        rel_logits = self.rel_h2o(uv_logits).transpose(2, 3)
+        logits += (rel_logits,)
+
+        if all(gold is not None for gold in [ner_gold, mod_gold, rel_gold]):
+            rel_loss = self.masked_BCEloss(
+                rel_logits,
+                rel_gold,
+                mask,
+                reduction
+            )
+        else:
+            rel_loss = None
+            rel_ix_triplets = self.inference(mask, decoded_ner_tags, rel_logits, self.id2rel)
+            pred_outputs += (rel_ix_triplets,)
+
+        return rel_loss, pred_outputs, rel_logits
 
     @staticmethod
     def description(epoch, epoch_num, output):

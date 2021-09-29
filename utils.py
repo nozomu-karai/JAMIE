@@ -2728,5 +2728,11 @@ def freeze_bert_layers(model, bert_name='encoder', freeze_embed=False, layer_lis
         else:
             p.requires_grad = True
 
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 

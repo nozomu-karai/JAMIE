@@ -5,7 +5,6 @@ import os
 import argparse
 import json
 from collections import defaultdict
-from torch.nn.modules.loss import MSELoss, KLDivLoss
 from tqdm import tqdm
 import torch
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
@@ -14,8 +13,6 @@ from model import *
 import clinical_eval
 from clinical_eval import MhsEvaluator
 import utils
-from torch import nn
-from torch.utils.tensorboard import SummaryWriter
 warnings.filterwarnings("ignore")
 
 
@@ -53,11 +50,14 @@ def eval_joint(model, eval_dataloader, eval_comments, eval_tok, eval_lab, eval_m
                     print(eval_rel[sent_id])
                     print()
 
-            preds, logits = model(
+        
+            _, preds, _ = model(
                 b_toks, b_attn_mask.bool(),
-                b_sent_mask.long()
+                b_sent_mask.long(),
+                ner_gold=b_ner, mod_gold=b_mod
             )
             b_pred_ner, b_pred_mod, b_pred_rel_ix = preds
+            
 
             # # ner tuple -> [sent_id, [ids], ner_lab]
             # b_gold_ner_tuple = utils.ner2tuple(b_sent_ids, b_gold_ner)
@@ -135,11 +135,6 @@ def main():
                         default="/home/feicheng/Tools/NICT_BERT-base_JapaneseWikipedia_32K_BPE",
                         type=str,
                         help="pre-trained model dir")
-
-    parser.add_argument("--pretrained_model_t",
-                        default="/home/feicheng/Tools/NICT_BERT-base_JapaneseWikipedia_32K_BPE",
-                        type=str,
-                        help="pre-trained teacher model dir")
 
     parser.add_argument("--saved_model", default='checkpoints/tmp/joint_mr_doc', type=str,
                         help="save/load model dir")
@@ -222,9 +217,6 @@ def main():
     parser.add_argument("--fp16_opt_level", type=str, default="O1",
                         help="For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']."
                              "See details at https://nvidia.github.io/apex/amp.html")
-
-    parser.add_argument("--alpha", default=0.5, type=float,
-                        help="(1 - alpha) is ratio of distill loss")
     
     parser.add_argument("--random_seed", default=0, type=int)
 
@@ -233,11 +225,6 @@ def main():
     args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.n_gpu = torch.cuda.device_count()
     utils.set_seed(args.random_seed)
-
-    if not os.path.exists(args.saved_model):
-        os.makedirs(args.saved_model)
-
-    writer = SummaryWriter(log_dir="../log/epo30/" + args.saved_model.split("/")[-1])
 
     print(args)
 
@@ -248,25 +235,20 @@ def main():
     if args.do_train:
 
         tokenizer = BertTokenizer.from_pretrained(
-            args.pretrained_model_t,
+            args.pretrained_model,
             do_lower_case=args.do_lower_case,
             do_basic_tokenize=False,
             tokenize_chinese_chars=False
         )
         tokenizer.add_tokens(['[JASP]'])
-        with open(os.path.join(args.pretrained_model_t, 'ner2ix.json')) as json_fi:
-            bio2ix = json.load(json_fi)
-        with open(os.path.join(args.pretrained_model_t, 'mod2ix.json')) as json_fi:
-            mod2ix = json.load(json_fi)
-        with open(os.path.join(args.pretrained_model_t, 'rel2ix.json')) as json_fi:
-            rel2ix = json.load(json_fi)
 
-        train_comments, train_toks, train_ners, train_mods, train_rels, _, _, _, _ = utils.extract_rel_data_from_mh_conll_v2(
+        train_comments, train_toks, train_ners, train_mods, train_rels, bio2ix, ne2ix, mod2ix, rel2ix = utils.extract_rel_data_from_mh_conll_v2(
             args.train_file,
             down_neg=0.0
         )
 
         print(bio2ix)
+        print(ne2ix)
         print(rel2ix)
         print(mod2ix)
         print()
@@ -324,21 +306,13 @@ def main():
         num_training_steps = args.num_epoch * num_epoch_steps
         save_step_interval = math.ceil(num_epoch_steps / args.save_step_portion)
 
-        teacher_model = torch.load(os.path.join(args.pretrained_model_t, 'model.pt'))
-        teacher_model.encoder.resize_token_embeddings(len(tokenizer))
-        teacher_model.to(args.device)
-
-        for param in teacher_model.parameters():
-            param.requires_grad = False
-
-        model = JointNerModReExtractorDistill(
+        model = RelExtracter(
             bert_url=args.pretrained_model,
             ner_emb_size=bio_emb_size, ner_vocab=bio2ix,
             mod_emb_size=mod_emb_size, mod_vocab=mod2ix,
             rel_emb_size=rel_emb_size, rel_vocab=rel2ix,
             device=args.device
         )
-        # model = torch.load(os.path.join(args.pretrained_model, 'model.pt'))
         model.encoder.resize_token_embeddings(len(tokenizer))
         model.to(args.device)
 
@@ -372,8 +346,6 @@ def main():
                 num_training_steps=num_training_steps
             )
 
-        mse_loss = MSELoss()
-
         if args.fp16:
             try:
                 from apex import amp
@@ -395,7 +367,6 @@ def main():
         for epoch in range(1, args.num_epoch + 1):
 
             train_loss, train_ner_loss, train_mod_loss, train_rel_loss = .0, .0, .0, .0
-            train_ner_loss_distill, train_mod_loss_distill, train_rel_loss_distill = .0, .0, .0
 
             epoch_iterator = tqdm(train_dataloader, desc="Iteration", total=len(train_dataloader))
             for step, batch in enumerate(epoch_iterator):
@@ -416,26 +387,11 @@ def main():
                     cls_max_len,
                     pad_tok='[PAD]') for sent_id in b_sent_ids]
 
-                _, logits_t = teacher_model(
+                rel_loss, _, _ = model(
                     b_toks, b_attn_mask.bool(),
                     b_sent_mask.long(),
                     ner_gold=b_ner, mod_gold=b_mod, rel_gold=b_gold_relmat, reduction=args.reduction
                 )
-                ner_logit_t, mod_logit_t, rel_logit_t = logits_t
-
-                losses, logits_s = model(
-                    b_toks, b_attn_mask.bool(),
-                    b_sent_mask.long(),
-                    ner_gold=b_ner, mod_gold=b_mod, rel_gold=b_gold_relmat, reduction=args.reduction
-                )
-                ner_loss, mod_loss, rel_loss = losses
-                ner_logit_s, mod_logit_s, rel_logit_s = logits_s
-                loss = ner_loss + mod_loss + rel_loss
-                ner_loss_distill = mse_loss(ner_logit_s, ner_logit_t)
-                mod_loss_distill = mse_loss(mod_logit_s, mod_logit_t)
-                rel_loss_distill = mse_loss(rel_logit_s, rel_logit_t)
-                loss_distill = ner_loss_distill + mod_loss_distill + rel_loss_distill
-                loss = (1 - args.alpha) * loss_distill + args.alpha * loss
 
                 if args.n_gpu > 1:
                     loss = loss.mean()
@@ -448,7 +404,7 @@ def main():
                         scaled_loss.backward()
                     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
                 else:
-                    loss.backward()
+                    rel_loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
                 optimizer.step()
@@ -456,18 +412,9 @@ def main():
                     scheduler.step()
                 model.zero_grad()
 
-                train_loss += loss.item()
-                train_ner_loss += ner_loss.item()
-                train_mod_loss += mod_loss.item()
                 train_rel_loss += rel_loss.item()
-                train_ner_loss_distill += ner_loss_distill.item()
-                train_mod_loss_distill += mod_loss_distill.item()
-                train_rel_loss_distill += rel_loss_distill.item()
                 epoch_iterator.set_description(
-                    f"L {train_loss/(step+1):.3f}, L_NER: {train_ner_loss/(step+1):.3f}, L_MOD: {train_mod_loss/(step+1):.3f}"
-                    f" L_REL: {train_rel_loss/(step+1):.3f}"
-                    f", L_NER_D: {train_ner_loss_distill/(step+1):.3f}, L_MOD_D: {train_mod_loss_distill/(step+1):.3f}, L_REL_D: {train_rel_loss_distill/(step+1):.3f}"
-                    f" | epoch: {epoch}/{args.num_epoch}:"
+                    f"L_REL: {train_rel_loss/(step+1):.6f} | epoch: {epoch}/{args.num_epoch}:"
                 )
 
                 if epoch > 5:
@@ -507,16 +454,6 @@ def main():
                             with open(os.path.join(args.saved_model, 'rel2ix.json'), 'w') as fp:
                                 json.dump(rel2ix, fp)
 
-            writer.add_scalar("loss/ner_loss", train_ner_loss / (step+1), global_step=epoch)
-            writer.add_scalar("loss/mod_loss", train_mod_loss / (step+1), global_step=epoch)
-            writer.add_scalar("loss/rel_loss", train_rel_loss / (step+1), global_step=epoch)
-            writer.add_scalar("loss/ner_loss_distill", train_ner_loss_distill / (step+1), global_step=epoch)
-            writer.add_scalar("loss/mod_loss_distill", train_mod_loss_distill / (step+1), global_step=epoch)
-            writer.add_scalar("loss/rel_loss_distill", train_rel_loss_distill / (step+1), global_step=epoch)
-            if epoch > 5:
-                writer.add_scalar("f1/dev_ner_f1", dev_ner_f1, global_step=epoch)
-                writer.add_scalar("f1/dev_mod_f1", dev_mod_f1, global_step=epoch)
-                writer.add_scalar("f1/dev_rel_f1", dev_rel_f1, global_step=epoch)
             eval_joint(model, dev_dataloader, dev_comment, dev_tok, dev_ner, dev_mod, dev_rel, dev_spo, bio2ix,
                        mod2ix, rel2ix, cls_max_len, args.device, "dev dataset",
                        print_levels=(1, 1, 1), out_file=args.dev_output, verbose=0)
