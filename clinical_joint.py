@@ -214,10 +214,13 @@ def main():
                         help="For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']."
                              "See details at https://nvidia.github.io/apex/amp.html")
 
+    parser.add_argument("--random_seed", default=0, type=int)
+
     args = parser.parse_args()
 
     args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.n_gpu = torch.cuda.device_count()
+    utils.set_seed(args.random_seed)
 
     print(args)
 

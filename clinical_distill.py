@@ -237,7 +237,7 @@ def main():
     if not os.path.exists(args.saved_model):
         os.makedirs(args.saved_model)
 
-    writer = SummaryWriter(log_dir="../log/epo30/" + args.saved_model.split("/")[-1])
+    #writer = SummaryWriter(log_dir="../log/epo30/" + args.saved_model.split("/")[-1])
 
     print(args)
 
@@ -331,14 +331,14 @@ def main():
         for param in teacher_model.parameters():
             param.requires_grad = False
 
-        model = JointNerModReExtractorDistill(
-            bert_url=args.pretrained_model,
-            ner_emb_size=bio_emb_size, ner_vocab=bio2ix,
-            mod_emb_size=mod_emb_size, mod_vocab=mod2ix,
-            rel_emb_size=rel_emb_size, rel_vocab=rel2ix,
-            device=args.device
-        )
-        # model = torch.load(os.path.join(args.pretrained_model, 'model.pt'))
+        # model = JointNerModReExtractorDistill(
+        #     bert_url=args.pretrained_model,
+        #     ner_emb_size=bio_emb_size, ner_vocab=bio2ix,
+        #     mod_emb_size=mod_emb_size, mod_vocab=mod2ix,
+        #     rel_emb_size=rel_emb_size, rel_vocab=rel2ix,
+        #     device=args.device
+        # )
+        model = torch.load(os.path.join(args.pretrained_model, 'model.pt'))
         model.encoder.resize_token_embeddings(len(tokenizer))
         model.to(args.device)
 
@@ -507,16 +507,16 @@ def main():
                             with open(os.path.join(args.saved_model, 'rel2ix.json'), 'w') as fp:
                                 json.dump(rel2ix, fp)
 
-            writer.add_scalar("loss/ner_loss", train_ner_loss / (step+1), global_step=epoch)
-            writer.add_scalar("loss/mod_loss", train_mod_loss / (step+1), global_step=epoch)
-            writer.add_scalar("loss/rel_loss", train_rel_loss / (step+1), global_step=epoch)
-            writer.add_scalar("loss/ner_loss_distill", train_ner_loss_distill / (step+1), global_step=epoch)
-            writer.add_scalar("loss/mod_loss_distill", train_mod_loss_distill / (step+1), global_step=epoch)
-            writer.add_scalar("loss/rel_loss_distill", train_rel_loss_distill / (step+1), global_step=epoch)
-            if epoch > 5:
-                writer.add_scalar("f1/dev_ner_f1", dev_ner_f1, global_step=epoch)
-                writer.add_scalar("f1/dev_mod_f1", dev_mod_f1, global_step=epoch)
-                writer.add_scalar("f1/dev_rel_f1", dev_rel_f1, global_step=epoch)
+            # writer.add_scalar("loss/ner_loss", train_ner_loss / (step+1), global_step=epoch)
+            # writer.add_scalar("loss/mod_loss", train_mod_loss / (step+1), global_step=epoch)
+            # writer.add_scalar("loss/rel_loss", train_rel_loss / (step+1), global_step=epoch)
+            # writer.add_scalar("loss/ner_loss_distill", train_ner_loss_distill / (step+1), global_step=epoch)
+            # writer.add_scalar("loss/mod_loss_distill", train_mod_loss_distill / (step+1), global_step=epoch)
+            # writer.add_scalar("loss/rel_loss_distill", train_rel_loss_distill / (step+1), global_step=epoch)
+            # if epoch > 5:
+            #     writer.add_scalar("f1/dev_ner_f1", dev_ner_f1, global_step=epoch)
+            #     writer.add_scalar("f1/dev_mod_f1", dev_mod_f1, global_step=epoch)
+            #     writer.add_scalar("f1/dev_rel_f1", dev_rel_f1, global_step=epoch)
             eval_joint(model, dev_dataloader, dev_comment, dev_tok, dev_ner, dev_mod, dev_rel, dev_spo, bio2ix,
                        mod2ix, rel2ix, cls_max_len, args.device, "dev dataset",
                        print_levels=(1, 1, 1), out_file=args.dev_output, verbose=0)
